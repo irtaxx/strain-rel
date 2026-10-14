@@ -1,0 +1,31 @@
+{
+  "_catatan": "Salin berkas ini jadi site.json lalu sesuaikan. Setiap kali unit dipindah ke lokasi baru, perbarui deployment_id dan lokasi, lalu buat baris baru di tabel strain_deployment.",
+
+  "unit_id": "unit-01",
+  "deployment_id": 1,
+  "lokasi": "Sepancar 212 - KM 24+500",
+
+  "port": "/dev/ttyUSB0",
+  "baud": 921600,
+  "fs_hz": 1000,
+
+  "gain": 64,
+  "bridge_n": 1,
+  "gauge_factor": 2.31,
+  "v_excitation": 3.3,
+  "vref": 2.048,
+
+  "_catatan_ambang": "Dari uji meja: derau 1550 hitungan, jadi 6x derau = 9300. Setelah merekam satu jam di lokasi saat sepi, hitung ulang dari derau rms yang sebenarnya.",
+  "ambang_hitungan": 9300,
+  "pre_detik": 1.5,
+  "hold_off_detik": 2.0,
+  "maks_durasi_detik": 60,
+  "min_durasi_detik": 0.3,
+  "baseline_detik": 60,
+
+  "url_event": "https://kaimonitoringiot.com/api/strain-event",
+  "api_key": "ganti-dengan-kunci-yang-sama-di-env-hosting",
+
+  "arsip_mentah": true,
+  "dir_data": "~/strain-data"
+}
