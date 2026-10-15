@@ -161,12 +161,6 @@ class Baseline:
     def nilai(self):
         return self.jumlah / len(self.buf) if self.buf else 0.0
 
-    def ambil_puncak(self):
-        """Nilai tertinggi sejak panggilan terakhir, lalu dinolkan."""
-        a, b = self.sta_puncak, self.rasio_puncak
-        self.sta_puncak = self.rasio_puncak = 0.0
-        return a, b
-
     @property
     def siap(self):
         # Sebelum penyangga terisi separuh, baseline belum bisa dipercaya
@@ -277,6 +271,12 @@ class Detektor:
         self.tertahan = 0           # rasio naik tapi tidak lolos lantai absolut
         self.timeout_beruntun = 0
         self.puncak_tolak = 0.0
+
+    def ambil_puncak(self):
+        """Nilai tertinggi sejak panggilan terakhir, lalu dinolkan."""
+        a, b = self.sta_puncak, self.rasio_puncak
+        self.sta_puncak = self.rasio_puncak = 0.0
+        return a, b
 
     @property
     def siap(self):
