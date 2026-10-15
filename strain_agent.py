@@ -161,6 +161,12 @@ class Baseline:
     def nilai(self):
         return self.jumlah / len(self.buf) if self.buf else 0.0
 
+    def ambil_puncak(self):
+        """Nilai tertinggi sejak panggilan terakhir, lalu dinolkan."""
+        a, b = self.sta_puncak, self.rasio_puncak
+        self.sta_puncak = self.rasio_puncak = 0.0
+        return a, b
+
     @property
     def siap(self):
         # Sebelum penyangga terisi separuh, baseline belum bisa dipercaya
@@ -223,6 +229,17 @@ class Detektor:
         # cukup jauh di bawah kereta teringan.
         self.sta_minimum = float(cfg.get("sta_minimum", 3000))
 
+        # Gerbang amplitudo. Dua penyaring di atas hanya menilai KERAMAIAN;
+        # keduanya bisa dilewati lonjakan sempit yang datang rapat, betapapun
+        # dangkalnya. Gerbang ini menilai KEDALAMAN: kalau titik terdalam
+        # sepanjang event masih di bawah angka ini, apa pun yang terjadi tadi
+        # terlalu kecil untuk disebut kereta.
+        #
+        # Dalam mikrostrain, bukan hitungan ADC, supaya angkanya tidak perlu
+        # dihitung ulang setiap kali gain diubah — dan supaya sama dengan
+        # kolom "Puncak" di tabel web.
+        self.min_puncak_ue = float(cfg.get("min_puncak_ue", 0))
+
         self.pre = deque(maxlen=int(fs * cfg["pre_detik"]))
         self.hold_off_blok = max(1, int(fs * cfg["hold_off_detik"] / self.blok_n))
         self.maks_n = int(fs * cfg["maks_durasi_detik"])
@@ -241,6 +258,12 @@ class Detektor:
         self.lta_jumlah = 0.0
         self.sta = 0.0
         self.rasio = 0.0
+
+        # Puncak sejak laporan terakhir. Baris status dicetak tiap 2-3 detik
+        # sementara blok diolah 20 kali per detik, jadi menampilkan blok
+        # terakhir menyembunyikan justru lonjakan yang memicu event.
+        self.sta_puncak = 0.0
+        self.rasio_puncak = 0.0
 
         self.aktif = False
         self.sampel = []
@@ -285,6 +308,8 @@ class Detektor:
 
         acuan = self.lta_jumlah / len(self.lta)
         self.rasio = (self.sta / acuan) if acuan > 0 else 0.0
+        self.sta_puncak = max(self.sta_puncak, self.sta)
+        self.rasio_puncak = max(self.rasio_puncak, self.rasio)
 
         if not self.aktif:
             # LTA hanya belajar saat tenang. Deque membuang yang terlama
@@ -372,21 +397,21 @@ class Detektor:
         if sisa > 0:
             data = data[:-sisa]
 
-        if len(data) < self.min_n or self.blok_ramai < self.min_blok_ramai:
+        puncak = max(abs(v - self.base_saat_trigger) for v in data) if data else 0.0
+        dangkal = (self.min_puncak_ue > 0
+                   and ke_microstrain(puncak, self.cfg) < self.min_puncak_ue)
+
+        if len(data) < self.min_n or self.blok_ramai < self.min_blok_ramai or dangkal:
             # Bukan kereta: gangguan listrik, getaran sesaat, atau kendaraan
             # yang lewat di dekat rel. Dicatat jumlahnya supaya kalau
             # penolakan jadi ratusan per jam, kelihatan bahwa lantai
             # absolutnya masih terlalu rendah untuk lokasi ini.
             self.ditolak += 1
-            if data:
-                self.puncak_tolak = max(
-                    self.puncak_tolak,
-                    max(abs(v - self.base_saat_trigger) for v in data),
-                )
+            self.puncak_tolak = max(self.puncak_tolak, puncak)
             if self.ditolak % 20 == 0:
-                print(f"  (derau ditolak: {self.ditolak} kali, "
-                      f"puncak tertinggi {self.puncak_tolak:,.0f} hitungan)"
-                      .replace(",", "."), flush=True)
+                print(f"  (ditolak: {self.ditolak} kali, puncak tertinggi "
+                      f"{ke_microstrain(self.puncak_tolak, self.cfg):.1f} µε)",
+                      flush=True)
             self.blok_ramai = 0
             return
 
@@ -953,6 +978,10 @@ def main():
           f"LTA {float(cfg.get('lta_detik', 30)):.0f} s, "
           f"picu {float(cfg.get('rasio_picu', 4.0)):.1f}x, "
           f"lepas {float(cfg.get('rasio_lepas', 2.0)):.1f}x")
+    print(f"         puncak minimum "
+          f"{float(cfg.get('min_puncak_ue', 0)):.0f} µε"
+          + ("  (MATI — event dangkal akan ikut terkirim)"
+             if not float(cfg.get("min_puncak_ue", 0)) else ""))
     print(f"         lantai {float(cfg.get('sta_minimum', 3000)):,.0f} hitungan"
           f"  (~{ke_microstrain(float(cfg.get('sta_minimum', 3000)), cfg):.1f} µε)"
           .replace(",", "."))
@@ -1176,6 +1205,7 @@ def main():
             if jendela:
                 b = detektor.baseline.nilai
                 lta = (detektor.lta_jumlah / len(detektor.lta)) if detektor.lta else 0.0
+                sta_p, rasio_p = detektor.ambil_puncak()
                 try:
                     antre = len([f for f in os.listdir(dir_antrean)
                                  if f.endswith(".json")]) if pengirim else 0
@@ -1190,8 +1220,8 @@ def main():
                 if stat["putus"]:
                     status += f"  putus {stat['putus']}x"
                 print(f"{time.strftime('%H:%M:%S'):>8} {len(jendela)/dt:8.1f}/s "
-                      f"{b:11.0f} {detektor.sta:9.0f} {lta:9.0f} "
-                      f"{detektor.rasio:6.1f}x "
+                      f"{b:11.0f} {sta_p:9.0f} {lta:9.0f} "
+                      f"{rasio_p:6.1f}x "
                       f"{stat['event']:6d} {antre:6d}  {status}")
             jendela = []
 
