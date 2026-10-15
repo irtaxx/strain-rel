@@ -173,103 +173,179 @@ class Baseline:
 # ======================================================================
 
 class Detektor:
+    """
+    Deteksi berdasarkan AKTIVITAS, bukan posisi — STA/LTA.
+
+    Rancangan lama bertanya "seberapa jauh nilai ini dari baseline?".
+    Pertanyaan itu tidak bisa membedakan kereta dari rel yang memuai:
+    keduanya memindahkan nilai, dan yang satu lambat sedangkan yang lain
+    cepat. Begitu hanyut termal melewati ambang, deteksi menyala dan tidak
+    pernah bisa mati lagi.
+
+    Sekarang yang ditanyakan "seberapa ramai sinyal ini dibanding biasanya?":
+
+      STA = simpangan baku dalam blok pendek (50 ms) — keramaian sesaat
+      LTA = rata-rata STA selama 30 detik terakhir — keramaian biasanya
+      rasio = STA / LTA
+
+    Hanyut sebesar apa pun tidak menaikkan rasio, karena dalam 50 ms ia
+    hampir tidak bergerak. Kereta menaikkannya puluhan kali lipat.
+
+    Dua sifat yang ikut didapat:
+
+    1. Rasio tidak bersatuan. Ambang 4x berlaku di akrilik maupun di baja,
+       pada gain berapa pun. Unit yang berpindah lokasi tidak perlu
+       dikalibrasi ulang.
+
+    2. Pintu keluarnya selebar pintu masuk. Dulu masuk butuh 8 sampel dan
+       keluar butuh 2.000 sampel berturut-turut tenang — timpang 250 kali,
+       dan itulah sebabnya event terkunci. Rasio jatuh ke sepersepuluh
+       begitu gerakan berhenti, jadi menutup event jadi mudah.
+
+    LTA dibekukan selama event. Tanpa itu, kereta sendiri menaikkan LTA,
+    rasionya mengecil, dan event tertutup di tengah lintasan.
+    """
+
     def __init__(self, cfg, saat_event_selesai):
         fs = cfg["fs_hz"]
         self.cfg = cfg
         self.fs = fs
-        self.ambang = cfg["ambang_hitungan"]
+
+        sta_detik = float(cfg.get("sta_detik", 0.05))
+        self.blok_n = max(1, int(fs * sta_detik))
+        self.lta_blok = max(4, int(float(cfg.get("lta_detik", 30)) / sta_detik))
+        self.rasio_picu = float(cfg.get("rasio_picu", 4.0))
+        self.rasio_lepas = float(cfg.get("rasio_lepas", 2.0))
+
+        # Lantai absolut. Rasio tidak bersatuan, jadi di lingkungan yang
+        # sangat sunyi goyangan 3 µε pun bisa menghasilkan rasio 10x.
+        # Lantai ini membuang hal-hal remeh; nilainya tidak perlu presisi,
+        # cukup jauh di bawah kereta teringan.
+        self.sta_minimum = float(cfg.get("sta_minimum", 3000))
+
         self.pre = deque(maxlen=int(fs * cfg["pre_detik"]))
-        self.hold_off_n = int(fs * cfg["hold_off_detik"])
+        self.hold_off_blok = max(1, int(fs * cfg["hold_off_detik"] / self.blok_n))
         self.maks_n = int(fs * cfg["maks_durasi_detik"])
         self.min_n = int(fs * cfg["min_durasi_detik"])
+        self.min_blok_ramai = max(
+            1, int(fs * float(cfg.get("min_lewat_detik", 0.15)) / self.blok_n))
 
-        # Dua penyaring terhadap derau. Keduanya perlu, karena masing-masing
-        # menangkap gangguan yang berbeda bentuknya.
-        #
-        # debounce_n: berapa sampel berurutan harus melewati ambang sebelum
-        # event dinyatakan mulai. Lonjakan listrik hanya selebar satu-dua
-        # sampel, sementara satu gandar kereta menekan rel puluhan milidetik.
-        #
-        # min_lewat_n: dari seluruh event, berapa sampel yang sungguh-sungguh
-        # di atas ambang. Ini pengganti min_durasi_detik, yang keliru mengukur
-        # panjang jendela tersimpan — dan jendela itu selalu panjang karena
-        # sudah termasuk pra-trigger dan ekor hold-off, sehingga satu lonjakan
-        # derau pun ikut lolos.
-        self.debounce_n = max(1, int(fs * cfg.get("debounce_detik", 0.008)))
-        self.min_lewat_n = max(1, int(fs * cfg.get("min_lewat_detik", 0.15)))
+        # Baseline ini TIDAK lagi dipakai untuk deteksi — hanya untuk kolom
+        # tampilan dan untuk memperlihatkan hanyut. Karena itu ia tidak
+        # pernah dibekukan, dan tidak bisa mengunci apa pun lagi.
         self.baseline = Baseline(fs, cfg["baseline_detik"])
         self.saat_selesai = saat_event_selesai
 
+        self.blok = []
+        self.lta = deque(maxlen=self.lta_blok)
+        self.lta_jumlah = 0.0
+        self.sta = 0.0
+        self.rasio = 0.0
+
         self.aktif = False
         self.sampel = []
-        self.diam = 0
+        self.diam_blok = 0
+        self.blok_ramai = 0
         self.base_saat_trigger = 0.0
         self.t_mulai = None
         self.jumlah_event = 0
 
-        self.calon = 0       # sampel berurutan di atas ambang, belum jadi event
-        self.n_lewat = 0     # total sampel di atas ambang dalam event ini
-        self.ditolak = 0     # event yang dibuang karena hanya derau
-        self.tertahan = 0    # lonjakan yang tidak lolos debounce
-        self.timeout_beruntun = 0   # event kepanjangan berturut-turut
+        self.ditolak = 0            # event yang dibuang karena terlalu singkat
+        self.tertahan = 0           # rasio naik tapi tidak lolos lantai absolut
+        self.timeout_beruntun = 0
         self.puncak_tolak = 0.0
 
+    @property
+    def siap(self):
+        """LTA sudah terisi penuh; sebelum itu tidak ada pembanding."""
+        return len(self.lta) >= self.lta_blok
+
     def olah(self, nilai, t_wall):
-        """Satu sampel masuk. t_wall = waktu dinding sampel pertama batch."""
+        """Sekumpulan sampel masuk. t_wall = waktu dinding sampel terakhir."""
         for v in nilai:
             self.baseline.tambah(v)
-            b = self.baseline.nilai
-            lewat = self.baseline.siap and abs(v - b) > self.ambang
-
-            if not self.aktif:
-                self.pre.append(v)
-                if not lewat:
-                    if self.calon:
-                        # Sempat melewati ambang tapi tidak bertahan. Dihitung
-                        # supaya terlihat seberapa sering derau nyaris memicu.
-                        self.tertahan += 1
-                    self.calon = 0
-                    continue
-
-                self.calon += 1
-                if self.calon < self.debounce_n:
-                    # Masih mungkin cuma lonjakan. Tunggu dulu — isi
-                    # pra-trigger tetap berjalan, jadi tidak ada yang hilang
-                    # kalau ternyata ini sungguh kereta.
-                    continue
-
-                # Mulai event. Isi penyangga pra-trigger ikut terbawa,
-                # supaya awal lintasan tidak terpotong.
-                self.aktif = True
-                self.baseline.beku = True
-                self.base_saat_trigger = b
-                self.sampel = list(self.pre)
-                self.diam = 0
-                self.n_lewat = self.calon
-                self.calon = 0
-                self.t_mulai = t_wall - len(self.pre) / self.fs
-            else:
+            if self.aktif:
                 self.sampel.append(v)
-                if lewat:
-                    self.n_lewat += 1
-                self.diam = 0 if lewat else self.diam + 1
+            else:
+                self.pre.append(v)
+            self.blok.append(v)
+            if len(self.blok) >= self.blok_n:
+                self._olah_blok(t_wall)
 
-                selesai = self.diam >= self.hold_off_n
-                kepanjangan = len(self.sampel) >= self.maks_n
-                if selesai or kepanjangan:
-                    self._tutup(kepanjangan)
+    def _olah_blok(self, t_wall):
+        b, self.blok = self.blok, []
+        n = len(b)
+        m = sum(b) / n
+        self.sta = (sum((v - m) ** 2 for v in b) / n) ** 0.5
+
+        if not self.siap:
+            self.lta.append(self.sta)
+            self.lta_jumlah += self.sta
+            return
+
+        acuan = self.lta_jumlah / len(self.lta)
+        self.rasio = (self.sta / acuan) if acuan > 0 else 0.0
+
+        if not self.aktif:
+            # LTA hanya belajar saat tenang. Deque membuang yang terlama
+            # sendiri, jadi jumlahnya dikurangi dulu sebelum menambah.
+            if len(self.lta) == self.lta.maxlen:
+                self.lta_jumlah -= self.lta[0]
+            self.lta.append(self.sta)
+            self.lta_jumlah += self.sta
+
+            if self.rasio <= self.rasio_picu:
+                return
+            if self.sta < self.sta_minimum:
+                self.tertahan += 1
+                return
+            self._mulai(t_wall)
+        else:
+            if self.rasio >= self.rasio_lepas:
+                self.diam_blok = 0
+                self.blok_ramai += 1
+            else:
+                self.diam_blok += 1
+
+            selesai = self.diam_blok >= self.hold_off_blok
+            kepanjangan = len(self.sampel) >= self.maks_n
+            if selesai or kepanjangan:
+                self._tutup(kepanjangan)
+
+    def _mulai(self, t_wall):
+        self.aktif = True
+        self.sampel = list(self.pre)
+        self.diam_blok = 0
+        self.blok_ramai = 1
+        self.t_mulai = t_wall - len(self.sampel) / self.fs
+
+        # Baseline event diambil MUNDUR, dari bagian paling awal penyangga
+        # pra-trigger — bagian yang masih tenang, sebelum gerakan dimulai.
+        # Median, bukan rata-rata, supaya satu ketukan nyasar di detik itu
+        # tidak menggesernya.
+        #
+        # Diambil dari yang paling awal, bukan yang paling tenang sepanjang
+        # rekaman: kalau rel hanyut, baseline lama memberi puncak yang salah
+        # sebesar hanyutnya. Yang dibutuhkan adalah tenang DAN baru.
+        kuota = min(len(self.sampel), int(self.fs * 1.0))
+        if kuota:
+            awal = sorted(self.sampel[:kuota])
+            self.base_saat_trigger = awal[kuota // 2]
+        else:
+            self.base_saat_trigger = self.baseline.nilai
 
     def _tutup(self, kepanjangan):
         self.aktif = False
-        self.baseline.beku = False
 
         if kepanjangan:
             # Kereta yang benar-benar lewat tidak menyentuh batas durasi.
-            # Yang menyentuhnya hampir selalu baseline yang sudah basi atau
-            # ambang di bawah lantai derau. Baseline dipelajari ulang supaya
-            # deteksi tidak langsung terpicu lagi oleh selisih yang sama.
+            # Yang menyentuhnya berarti sesuatu bergetar terus-menerus —
+            # mesin, angin kencang, atau sensor yang bermasalah. LTA
+            # dikosongkan supaya ia belajar ulang seperti apa "biasanya"
+            # di keadaan yang baru itu.
             self.timeout_beruntun += 1
-            self.baseline.reset()
+            self.lta.clear()
+            self.lta_jumlah = 0.0
 
             # Timeout PERTAMA tetap diteruskan: bisa saja itu rangkaian
             # barang yang benar-benar lebih panjang dari batas durasi, dan
@@ -278,15 +354,12 @@ class Detektor:
             if self.timeout_beruntun >= 2:
                 self.sampel = []
                 self.pre.clear()
-                self.n_lewat = 0
-                self.calon = 0
+                self.blok_ramai = 0
                 print(f"  ! Event ke-{self.timeout_beruntun} berturut-turut "
                       f"ditutup karena kepanjangan ({self.cfg['maks_durasi_detik']} s).\n"
-                      f"    Ini bukan kereta. Ambang {self.ambang:,} hitungan "
-                      f"kemungkinan di bawah lantai derau di lokasi ini.\n"
+                      f"    Ada yang bergetar terus-menerus di dekat sensor.\n"
                       f"    Jalankan:  python3 strain_agent.py --ukur 60\n"
-                      f"    Paket ini TIDAK dikirim ke web."
-                      .replace(",", "."), flush=True)
+                      f"    Paket ini TIDAK dikirim ke web.", flush=True)
                 return
         else:
             self.timeout_beruntun = 0
@@ -295,15 +368,15 @@ class Detektor:
         self.pre.clear()
 
         # Buang ekor diam, sisakan sedikit untuk konteks
-        sisa = max(0, self.diam - int(0.3 * self.fs))
+        sisa = max(0, self.diam_blok * self.blok_n - int(0.3 * self.fs))
         if sisa > 0:
             data = data[:-sisa]
 
-        if len(data) < self.min_n or self.n_lewat < self.min_lewat_n:
+        if len(data) < self.min_n or self.blok_ramai < self.min_blok_ramai:
             # Bukan kereta: gangguan listrik, getaran sesaat, atau kendaraan
             # yang lewat di dekat rel. Dicatat jumlahnya supaya kalau
-            # penolakan jadi ratusan per jam, kelihatan bahwa ambangnya
-            # masih terlalu rendah untuk lokasi ini.
+            # penolakan jadi ratusan per jam, kelihatan bahwa lantai
+            # absolutnya masih terlalu rendah untuk lokasi ini.
             self.ditolak += 1
             if data:
                 self.puncak_tolak = max(
@@ -314,10 +387,10 @@ class Detektor:
                 print(f"  (derau ditolak: {self.ditolak} kali, "
                       f"puncak tertinggi {self.puncak_tolak:,.0f} hitungan)"
                       .replace(",", "."), flush=True)
-            self.n_lewat = 0
+            self.blok_ramai = 0
             return
 
-        self.n_lewat = 0
+        self.blok_ramai = 0
         self.jumlah_event += 1
         self.saat_selesai(data, self.base_saat_trigger, self.t_mulai, kepanjangan)
 
@@ -800,6 +873,19 @@ def ukur_derau(cfg, detik):
     # rata-ratanya. Margin 30% untuk derau yang belum sempat terlihat.
     usul = int(round(max(simpangan) * 1.3 / 100.0) * 100)
 
+    # Lantai STA: sekitar 3x keramaian khas saat diam. Dihitung dari blok
+    # 50 ms, ukuran yang sama persis dipakai detektor — bukan dari
+    # simpangan terhadap baseline, yang ikut terbawa hanyut.
+    blok = max(1, int(fs * float(cfg.get("sta_detik", 0.05))))
+    stas = []
+    for i in range(0, max(0, len(level) - blok), blok):
+        q = level[i:i + blok]
+        mq = sum(q) / blok
+        stas.append((sum((v - mq) ** 2 for v in q) / blok) ** 0.5)
+    stas.sort()
+    sta_khas = stas[len(stas) // 2] if stas else 0.0
+    usul_lantai = max(100, int(round(sta_khas * 3 / 100.0) * 100))
+
     print(f"\n\n=== Hasil pengukuran, {len(simpangan):,} sampel ===".replace(",", "."))
     print(f"  simpangan median    : {p(0.50):>10,.0f} hitungan".replace(",", "."))
     print(f"  simpangan p99       : {p(0.99):>10,.0f}".replace(",", "."))
@@ -807,24 +893,29 @@ def ukur_derau(cfg, detik):
     print(f"  simpangan tertinggi : {max(simpangan):>10,.0f}".replace(",", "."))
     print(f"  hanyut level        : {hanyut:>10,.0f} selama {detik} detik"
           .replace(",", "."))
+    print(f"  STA khas (50 ms)    : {sta_khas:>10,.0f}".replace(",", "."))
     print()
-    print(f"  Ambang sekarang : {cfg['ambang_hitungan']:>10,.0f} hitungan"
-          f"  (~{ke_microstrain(cfg['ambang_hitungan'], cfg):.0f} µε)".replace(",", "."))
-    print(f"  USULAN          : {usul:>10,.0f} hitungan"
-          f"  (~{ke_microstrain(usul, cfg):.0f} µε)".replace(",", "."))
+    print(f"  Lantai sekarang : {float(cfg.get('sta_minimum', 3000)):>10,.0f} hitungan"
+          f"  (~{ke_microstrain(float(cfg.get('sta_minimum', 3000)), cfg):.0f} µε)"
+          .replace(",", "."))
+    print(f"  USULAN          : {usul_lantai:>10,.0f} hitungan"
+          f"  (~{ke_microstrain(usul_lantai, cfg):.0f} µε)".replace(",", "."))
     print()
 
-    if usul > cfg["ambang_hitungan"] * 3:
-        print("  Deraunya jauh di atas ambang sekarang. Sebelum sekadar")
-        print("  menaikkan ambang, periksa dulu:")
+    if usul_lantai > float(cfg.get("sta_minimum", 3000)) * 3:
+        print("  Deraunya jauh di atas lantai sekarang. Sebelum sekadar")
+        print("  menaikkannya, periksa dulu:")
         print("    - perekat gauge sudah benar-benar kering dan menempel?")
         print("    - kabel gauge terpilin dan terlindung (shielded)?")
         print("    - grounding ESP32 dan ADS1220 menyatu?")
         print("    - gain 64 mungkin terlalu tinggi; coba 32.")
-        print("  Ambang tinggi menyembunyikan derau, tidak menghilangkannya —")
+        print("  Lantai tinggi menyembunyikan derau, tidak menghilangkannya —")
         print("  dan ikut menyembunyikan kereta yang ringan.")
         print()
-    print(f'  Kalau sudah yakin, ubah di site.json:  "ambang_hitungan": {usul},')
+    print(f'  Kalau sudah yakin, ubah di site.json:  "sta_minimum": {usul_lantai},')
+    print()
+    print("  Rasio picu dan lepas tidak perlu diubah. Keduanya tidak")
+    print("  bersatuan, jadi tetap berlaku di lokasi dan bahan mana pun.")
 
 
 def main():
@@ -857,11 +948,14 @@ def main():
 
     print(f"Unit   : {cfg['unit_id']}  (deployment {cfg['deployment_id']})")
     print(f"Lokasi : {cfg['lokasi']}")
-    print(f"Ambang : {cfg['ambang_hitungan']:,} hitungan"
-          f"  (~{ke_microstrain(cfg['ambang_hitungan'], cfg):.1f} µε)".replace(",", "."))
-    print(f"Saring : butuh {cfg.get('debounce_detik', 0.008)*1000:.0f} ms berurutan "
-          f"di atas ambang untuk memicu, "
-          f"total {cfg.get('min_lewat_detik', 0.15)*1000:.0f} ms untuk diterima")
+    print(f"Deteksi: STA/LTA — rasio keramaian, bukan ambang posisi")
+    print(f"         STA {float(cfg.get('sta_detik', 0.05))*1000:.0f} ms, "
+          f"LTA {float(cfg.get('lta_detik', 30)):.0f} s, "
+          f"picu {float(cfg.get('rasio_picu', 4.0)):.1f}x, "
+          f"lepas {float(cfg.get('rasio_lepas', 2.0)):.1f}x")
+    print(f"         lantai {float(cfg.get('sta_minimum', 3000)):,.0f} hitungan"
+          f"  (~{ke_microstrain(float(cfg.get('sta_minimum', 3000)), cfg):.1f} µε)"
+          .replace(",", "."))
     print(f"Port   : {cfg['port']} @ {cfg['baud']}\n")
 
     ser = buka_port(cfg)
@@ -984,8 +1078,8 @@ def main():
     bersihkan(cfg, cfg["dir_data"])
 
     print("Berjalan. Ctrl-C untuk berhenti.\n")
-    print(f"{'waktu':>8} {'laju':>9} {'baseline':>11} {'derau':>9} "
-          f"{'simpangan':>11} {'event':>6} {'antre':>6}")
+    print(f"{'waktu':>8} {'laju':>9} {'baseline':>11} {'sta':>9} "
+          f"{'lta':>9} {'rasio':>7} {'event':>6} {'antre':>6}")
 
     while jalan["on"]:
         # ESP32 bisa lepas sewaktu-waktu: kabel goyang, daya turun sesaat,
@@ -1081,19 +1175,23 @@ def main():
             t_lapor = now
             if jendela:
                 b = detektor.baseline.nilai
-                m = sum(jendela) / len(jendela)
-                rms = (sum((v - m) ** 2 for v in jendela) / len(jendela)) ** .5
-                simpangan = max(abs(v - b) for v in jendela)
+                lta = (detektor.lta_jumlah / len(detektor.lta)) if detektor.lta else 0.0
                 try:
                     antre = len([f for f in os.listdir(dir_antrean)
                                  if f.endswith(".json")]) if pengirim else 0
                 except OSError:
                     antre = 0
-                status = "AKTIF" if detektor.aktif else ""
+                if not detektor.siap:
+                    status = "belajar LTA"
+                elif detektor.aktif:
+                    status = "AKTIF"
+                else:
+                    status = ""
                 if stat["putus"]:
                     status += f"  putus {stat['putus']}x"
                 print(f"{time.strftime('%H:%M:%S'):>8} {len(jendela)/dt:8.1f}/s "
-                      f"{b:11.0f} {rms:9.0f} {simpangan:11.0f} "
+                      f"{b:11.0f} {detektor.sta:9.0f} {lta:9.0f} "
+                      f"{detektor.rasio:6.1f}x "
                       f"{stat['event']:6d} {antre:6d}  {status}")
             jendela = []
 
