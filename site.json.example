@@ -34,5 +34,9 @@
   "api_key": "ganti-dengan-kunci-yang-sama-di-env-hosting",
 
   "arsip_mentah": true,
-  "dir_data": "~/strain-data"
+  "dir_data": "~/strain-data",
+
+  "_catatan_simpan": "Berapa hari berkas lama disimpan sebelum DIHAPUS (bukan dipindah). Arsip mentah 1000 Hz tumbuh sekitar 345 MB per hari, jadi 14 hari butuh sekitar 5 GB. Folder antrean tidak pernah ikut dihapus. Isi 0 untuk tidak menghapus sama sekali — hanya kalau Anda memantau ruang kartu sendiri.",
+  "simpan_mentah_hari": 14,
+  "simpan_event_hari": 90
 }

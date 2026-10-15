@@ -24,6 +24,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import signal
 import struct
 import sys
@@ -134,6 +135,20 @@ class Baseline:
         self.jumlah = 0.0
         self.beku = False
 
+    def reset(self):
+        """
+        Lupakan semuanya dan pelajari ulang dari nol.
+
+        Dipakai setelah event ditutup paksa karena kepanjangan. Baseline
+        saat itu sudah dibekukan berpuluh detik dan kemungkinan besar
+        sudah jauh dari level sebenarnya. Kalau dipakai lagi apa adanya,
+        simpangannya tetap besar, event langsung terpicu lagi, dan
+        baseline membeku lagi — lingkaran yang tidak bisa keluar sendiri.
+        """
+        self.buf.clear()
+        self.jumlah = 0.0
+        self.beku = False
+
     def tambah(self, v):
         if self.beku:
             return
@@ -196,6 +211,7 @@ class Detektor:
         self.n_lewat = 0     # total sampel di atas ambang dalam event ini
         self.ditolak = 0     # event yang dibuang karena hanya derau
         self.tertahan = 0    # lonjakan yang tidak lolos debounce
+        self.timeout_beruntun = 0   # event kepanjangan berturut-turut
         self.puncak_tolak = 0.0
 
     def olah(self, nilai, t_wall):
@@ -246,6 +262,34 @@ class Detektor:
     def _tutup(self, kepanjangan):
         self.aktif = False
         self.baseline.beku = False
+
+        if kepanjangan:
+            # Kereta yang benar-benar lewat tidak menyentuh batas durasi.
+            # Yang menyentuhnya hampir selalu baseline yang sudah basi atau
+            # ambang di bawah lantai derau. Baseline dipelajari ulang supaya
+            # deteksi tidak langsung terpicu lagi oleh selisih yang sama.
+            self.timeout_beruntun += 1
+            self.baseline.reset()
+
+            # Timeout PERTAMA tetap diteruskan: bisa saja itu rangkaian
+            # barang yang benar-benar lebih panjang dari batas durasi, dan
+            # membuangnya berarti kehilangan data asli. Yang kedua dan
+            # seterusnya baru dianggap kemacetan.
+            if self.timeout_beruntun >= 2:
+                self.sampel = []
+                self.pre.clear()
+                self.n_lewat = 0
+                self.calon = 0
+                print(f"  ! Event ke-{self.timeout_beruntun} berturut-turut "
+                      f"ditutup karena kepanjangan ({self.cfg['maks_durasi_detik']} s).\n"
+                      f"    Ini bukan kereta. Ambang {self.ambang:,} hitungan "
+                      f"kemungkinan di bawah lantai derau di lokasi ini.\n"
+                      f"    Jalankan:  python3 strain_agent.py --ukur 60\n"
+                      f"    Paket ini TIDAK dikirim ke web."
+                      .replace(",", "."), flush=True)
+                return
+        else:
+            self.timeout_beruntun = 0
         data = self.sampel
         self.sampel = []
         self.pre.clear()
@@ -530,6 +574,94 @@ class ArsipMentah:
             self.f = None
 
 
+# ======================================================================
+# Pembersihan berkala
+# ======================================================================
+
+def bersihkan(cfg, dir_data, diam=False):
+    """
+    Membuang berkas lama. Dihapus, bukan dipindah atau dipadatkan.
+
+    Arsip mentah tumbuh sekitar 345 MB per hari pada 1000 Hz. Tanpa
+    pembersihan, kartu 32 GB penuh dalam hitungan minggu, dan saat penuh
+    agent berhenti menulis tanpa ada yang tahu di lapangan.
+
+    Folder antrean TIDAK PERNAH disentuh. Isinya event yang belum sampai
+    ke web; menghapusnya berarti menghilangkan data yang belum ada
+    salinannya di mana pun.
+    """
+    hari_mentah = int(cfg.get("simpan_mentah_hari", 14))
+    hari_event  = int(cfg.get("simpan_event_hari", 90))
+    sekarang = time.time()
+    terhapus, dibebaskan = 0, 0
+
+    def buang(path):
+        nonlocal terhapus, dibebaskan
+        try:
+            ukuran = os.path.getsize(path)
+            os.remove(path)
+            terhapus += 1
+            dibebaskan += ukuran
+        except OSError:
+            pass
+
+    # --- Arsip mentah: folder per tanggal ---
+    if hari_mentah > 0 and os.path.isdir(dir_data):
+        batas = sekarang - hari_mentah * 86400
+        for nama in os.listdir(dir_data):
+            # Hanya folder bernama tanggal. 'events' dan 'antrean' lolos
+            # dari pola ini dengan sendirinya.
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", nama):
+                continue
+            d = os.path.join(dir_data, nama)
+            if not os.path.isdir(d):
+                continue
+            try:
+                umur = datetime.strptime(nama, "%Y-%m-%d").timestamp()
+            except ValueError:
+                continue
+            if umur >= batas:
+                continue
+            for berkas in os.listdir(d):
+                buang(os.path.join(d, berkas))
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+
+    # --- Salinan event lokal ---
+    dir_event = os.path.join(dir_data, "events")
+    if hari_event > 0 and os.path.isdir(dir_event):
+        batas = sekarang - hari_event * 86400
+        for nama in os.listdir(dir_event):
+            if not nama.endswith(".json"):
+                continue
+            path = os.path.join(dir_event, nama)
+            try:
+                if os.path.getmtime(path) < batas:
+                    buang(path)
+            except OSError:
+                pass
+
+    if terhapus and not diam:
+        print(f"  Pembersihan: {terhapus} berkas dihapus, "
+              f"{dibebaskan / 1048576:.0f} MB dibebaskan "
+              f"(mentah >{hari_mentah} hari, event >{hari_event} hari)",
+              flush=True)
+    return terhapus, dibebaskan
+
+
+def sisa_ruang_persen(path):
+    """Persentase ruang terpakai pada partisi tempat path berada."""
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        bebas = st.f_bavail * st.f_frsize
+        return 100.0 * (total - bebas) / total if total else 0.0
+    except OSError:
+        return 0.0
+
+
 
 # ======================================================================
 # Pembukaan port yang tahan lepas-pasang
@@ -591,6 +723,110 @@ def buka_port(cfg, diam=False):
 # Program utama
 # ======================================================================
 
+def ukur_derau(cfg, detik):
+    """
+    Mengukur lantai derau di lokasi, lalu mengusulkan ambang.
+
+    Ambang 9.300 di berkas contoh berasal dari uji meja: sensor tenang di
+    ruangan tenang. Di rel, dasarnya berbeda — getaran tanah dari jalan,
+    induksi dari kabel sinyal, dan pemuaian termal rel itu sendiri. Ambang
+    yang lebih rendah daripada derau membuat deteksi menyala terus.
+
+    Jalankan saat TIDAK ada kereta lewat.
+    """
+    print(f"Mengukur derau selama {detik} detik. Pastikan tidak ada kereta "
+          f"lewat selama pengukuran.\n")
+    ser = buka_port(cfg)
+    fs = cfg["fs_hz"]
+    base = Baseline(fs, cfg["baseline_detik"])
+
+    buf = bytearray()
+    simpangan, level = [], []
+    t0 = time.time()
+
+    while time.time() - t0 < detik:
+        try:
+            chunk = ser.read(4096)
+        except (serial.SerialException, OSError) as e:
+            print(f"  Port terputus: {e}")
+            break
+        if chunk:
+            buf.extend(chunk)
+
+        while True:
+            i = buf.find(MAGIC)
+            if i < 0:
+                if len(buf) > 2:
+                    del buf[:-1]
+                break
+            if i > 0:
+                del buf[:i]
+            if len(buf) < HEADER:
+                break
+            if buf[2] != VERSION or not (0 < buf[3] <= 200):
+                del buf[:2]
+                continue
+            n = buf[3]
+            total = HEADER + 4 * n + 2
+            if len(buf) < total:
+                break
+            frame = bytes(buf[:total])
+            del buf[:total]
+            if struct.unpack_from("<H", frame, total - 2)[0] != crc16(frame[2:total - 2]):
+                continue
+            for v in struct.unpack(f"<{n}i", frame[HEADER:HEADER + 4 * n]):
+                base.tambah(v)
+                level.append(v)
+                if base.siap:
+                    simpangan.append(abs(v - base.nilai))
+
+        sisa = detik - (time.time() - t0)
+        if int(sisa) % 10 == 0 and sisa > 1:
+            print(f"  sisa {int(sisa)} detik, {len(level):,} sampel"
+                  .replace(",", "."), end="\r", flush=True)
+
+    ser.close()
+
+    if len(simpangan) < fs * 5:
+        print("\nData terlalu sedikit. Periksa sambungan ESP32 lalu ulangi.")
+        return
+
+    simpangan.sort()
+    p = lambda q: simpangan[min(len(simpangan) - 1, int(len(simpangan) * q))]
+    hanyut = max(level[-fs:]) - min(level[:fs]) if len(level) > 2 * fs else 0
+
+    # Ambang diambil dari nilai terbesar yang sempat muncul saat tenang,
+    # bukan dari rms. Yang memicu deteksi palsu memang puncak derau, bukan
+    # rata-ratanya. Margin 30% untuk derau yang belum sempat terlihat.
+    usul = int(round(max(simpangan) * 1.3 / 100.0) * 100)
+
+    print(f"\n\n=== Hasil pengukuran, {len(simpangan):,} sampel ===".replace(",", "."))
+    print(f"  simpangan median    : {p(0.50):>10,.0f} hitungan".replace(",", "."))
+    print(f"  simpangan p99       : {p(0.99):>10,.0f}".replace(",", "."))
+    print(f"  simpangan p99,9     : {p(0.999):>10,.0f}".replace(",", "."))
+    print(f"  simpangan tertinggi : {max(simpangan):>10,.0f}".replace(",", "."))
+    print(f"  hanyut level        : {hanyut:>10,.0f} selama {detik} detik"
+          .replace(",", "."))
+    print()
+    print(f"  Ambang sekarang : {cfg['ambang_hitungan']:>10,.0f} hitungan"
+          f"  (~{ke_microstrain(cfg['ambang_hitungan'], cfg):.0f} µε)".replace(",", "."))
+    print(f"  USULAN          : {usul:>10,.0f} hitungan"
+          f"  (~{ke_microstrain(usul, cfg):.0f} µε)".replace(",", "."))
+    print()
+
+    if usul > cfg["ambang_hitungan"] * 3:
+        print("  Deraunya jauh di atas ambang sekarang. Sebelum sekadar")
+        print("  menaikkan ambang, periksa dulu:")
+        print("    - perekat gauge sudah benar-benar kering dan menempel?")
+        print("    - kabel gauge terpilin dan terlindung (shielded)?")
+        print("    - grounding ESP32 dan ADS1220 menyatu?")
+        print("    - gain 64 mungkin terlalu tinggi; coba 32.")
+        print("  Ambang tinggi menyembunyikan derau, tidak menghilangkannya —")
+        print("  dan ikut menyembunyikan kereta yang ringan.")
+        print()
+    print(f'  Kalau sudah yakin, ubah di site.json:  "ambang_hitungan": {usul},')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="site.json")
@@ -598,6 +834,8 @@ def main():
     ap.add_argument("--ambang", type=int, default=0, help="ambang hitungan ADC")
     ap.add_argument("--no-upload", action="store_true", help="jangan kirim ke web")
     ap.add_argument("--no-raw", action="store_true", help="jangan arsipkan data mentah")
+    ap.add_argument("--ukur", type=int, default=0, metavar="DETIK",
+                    help="ukur lantai derau lalu usulkan ambang, tanpa merekam")
     args = ap.parse_args()
 
     cfg = muat_konfigurasi(args.config)
@@ -607,6 +845,10 @@ def main():
         cfg["ambang_hitungan"] = args.ambang
     if args.no_raw:
         cfg["arsip_mentah"] = False
+
+    if args.ukur:
+        ukur_derau(cfg, args.ukur)
+        return
 
     fs = cfg["fs_hz"]
     dir_event = os.path.join(cfg["dir_data"], "events")
@@ -734,7 +976,12 @@ def main():
     prev_seq = None
     t_mulai_program = time.time()
     t_lapor = t_mulai_program
+    t_bersih = t_mulai_program
     jendela = []
+
+    # Sekali saat mulai: kalau Pi sempat mati berminggu-minggu, berkas lama
+    # sudah menumpuk sebelum baris pertama ditulis.
+    bersihkan(cfg, cfg["dir_data"])
 
     print("Berjalan. Ctrl-C untuk berhenti.\n")
     print(f"{'waktu':>8} {'laju':>9} {'baseline':>11} {'derau':>9} "
@@ -811,6 +1058,24 @@ def main():
             jendela.extend(nilai)
 
         now = time.time()
+        if now - t_bersih >= 3600:
+            t_bersih = now
+            bersihkan(cfg, cfg["dir_data"])
+
+            # Jaring terakhir. Kalau kartu tetap hampir penuh meski sudah
+            # dibersihkan, retensi dipangkas sendiri sampai ada ruang.
+            # Arsip mentah yang hilang jauh lebih murah daripada agent yang
+            # berhenti menulis di lokasi yang tidak bisa dijangkau hari itu.
+            persen = sisa_ruang_persen(cfg["dir_data"])
+            hari = int(cfg.get("simpan_mentah_hari", 14))
+            while persen >= 90 and hari > 1:
+                hari = max(1, hari // 2)
+                cfg["simpan_mentah_hari"] = hari
+                print(f"  ! Kartu {persen:.0f}% penuh. Retensi arsip mentah "
+                      f"dipangkas ke {hari} hari.", flush=True)
+                bersihkan(cfg, cfg["dir_data"])
+                persen = sisa_ruang_persen(cfg["dir_data"])
+
         if now - t_lapor >= 2.0:
             dt = now - t_lapor
             t_lapor = now

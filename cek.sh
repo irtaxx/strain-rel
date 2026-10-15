@@ -92,6 +92,11 @@ if [ -d "$DIRDATA" ]; then
 
     EVBARU="$(ls -t "$DIRDATA/events"/*.json 2>/dev/null | head -1)"
     [ -n "$EVBARU" ] && echo "  event terakhir : $(date -r "$EVBARU" '+%d %b %H:%M:%S')"
+
+    TOTAL="$(du -sh "$DIRDATA" 2>/dev/null | cut -f1)"
+    NHARI="$(ls -d "$DIRDATA"/20??-??-?? 2>/dev/null | wc -l)"
+    SIMPAN="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('simpan_mentah_hari',14))" "$FOLDER/site.json" 2>/dev/null)"
+    echo "  arsip tersimpan: ${TOTAL:-?} dalam $NHARI hari${SIMPAN:+, batas $SIMPAN hari}"
 else
     echo -e "  ${KUNING}!${N} folder $DIRDATA belum ada"
 fi
