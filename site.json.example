@@ -19,8 +19,15 @@
   "ambang_hitungan": 9300,
   "pre_detik": 1.5,
   "hold_off_detik": 2.0,
-  "maks_durasi_detik": 60,
+  "maks_durasi_detik": 180,
   "min_durasi_detik": 0.3,
+
+  "_catatan_ringkas": "Ukuran kantong waktu untuk grafik yang dikirim ke web. 1.0 = satu kantong per detik (paling ringan, menunjukkan selubung kereta tapi gandar tidak terlihat). 0.1 = sepersepuluh detik, masih ringan dan kelompok bogi sudah terbaca. 0 = kirim penuh 1000 Hz. Puncak, jumlah gandar, dan kecepatan selalu dihitung dari data penuh 1000 Hz sebelum diringkas, jadi angka-angkanya tidak terpengaruh.",
+  "ringkas_detik": 1.0,
+
+  "_catatan_derau": "Dua kunci di bawah menyaring derau. debounce_detik = berapa lama sinyal harus bertahan di atas ambang sebelum dianggap event; lonjakan listrik hanya selebar 1-2 sampel. min_lewat_detik = total waktu di atas ambang dalam satu event; satu gandar saja sudah lebih dari 0,15 detik. Naikkan kalau masih ada event palsu, turunkan kalau kereta cepat ikut terbuang.",
+  "debounce_detik": 0.008,
+  "min_lewat_detik": 0.15,
   "baseline_detik": 60,
 
   "url_event": "https://kaimonitoringiot.com/api/strain-event",

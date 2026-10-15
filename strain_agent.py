@@ -167,6 +167,21 @@ class Detektor:
         self.hold_off_n = int(fs * cfg["hold_off_detik"])
         self.maks_n = int(fs * cfg["maks_durasi_detik"])
         self.min_n = int(fs * cfg["min_durasi_detik"])
+
+        # Dua penyaring terhadap derau. Keduanya perlu, karena masing-masing
+        # menangkap gangguan yang berbeda bentuknya.
+        #
+        # debounce_n: berapa sampel berurutan harus melewati ambang sebelum
+        # event dinyatakan mulai. Lonjakan listrik hanya selebar satu-dua
+        # sampel, sementara satu gandar kereta menekan rel puluhan milidetik.
+        #
+        # min_lewat_n: dari seluruh event, berapa sampel yang sungguh-sungguh
+        # di atas ambang. Ini pengganti min_durasi_detik, yang keliru mengukur
+        # panjang jendela tersimpan — dan jendela itu selalu panjang karena
+        # sudah termasuk pra-trigger dan ekor hold-off, sehingga satu lonjakan
+        # derau pun ikut lolos.
+        self.debounce_n = max(1, int(fs * cfg.get("debounce_detik", 0.008)))
+        self.min_lewat_n = max(1, int(fs * cfg.get("min_lewat_detik", 0.15)))
         self.baseline = Baseline(fs, cfg["baseline_detik"])
         self.saat_selesai = saat_event_selesai
 
@@ -177,6 +192,12 @@ class Detektor:
         self.t_mulai = None
         self.jumlah_event = 0
 
+        self.calon = 0       # sampel berurutan di atas ambang, belum jadi event
+        self.n_lewat = 0     # total sampel di atas ambang dalam event ini
+        self.ditolak = 0     # event yang dibuang karena hanya derau
+        self.tertahan = 0    # lonjakan yang tidak lolos debounce
+        self.puncak_tolak = 0.0
+
     def olah(self, nilai, t_wall):
         """Satu sampel masuk. t_wall = waktu dinding sampel pertama batch."""
         for v in nilai:
@@ -186,17 +207,35 @@ class Detektor:
 
             if not self.aktif:
                 self.pre.append(v)
-                if lewat:
-                    # Mulai event. Isi penyangga pra-trigger ikut terbawa,
-                    # supaya awal lintasan tidak terpotong.
-                    self.aktif = True
-                    self.baseline.beku = True
-                    self.base_saat_trigger = b
-                    self.sampel = list(self.pre)
-                    self.diam = 0
-                    self.t_mulai = t_wall - len(self.pre) / self.fs
+                if not lewat:
+                    if self.calon:
+                        # Sempat melewati ambang tapi tidak bertahan. Dihitung
+                        # supaya terlihat seberapa sering derau nyaris memicu.
+                        self.tertahan += 1
+                    self.calon = 0
+                    continue
+
+                self.calon += 1
+                if self.calon < self.debounce_n:
+                    # Masih mungkin cuma lonjakan. Tunggu dulu — isi
+                    # pra-trigger tetap berjalan, jadi tidak ada yang hilang
+                    # kalau ternyata ini sungguh kereta.
+                    continue
+
+                # Mulai event. Isi penyangga pra-trigger ikut terbawa,
+                # supaya awal lintasan tidak terpotong.
+                self.aktif = True
+                self.baseline.beku = True
+                self.base_saat_trigger = b
+                self.sampel = list(self.pre)
+                self.diam = 0
+                self.n_lewat = self.calon
+                self.calon = 0
+                self.t_mulai = t_wall - len(self.pre) / self.fs
             else:
                 self.sampel.append(v)
+                if lewat:
+                    self.n_lewat += 1
                 self.diam = 0 if lewat else self.diam + 1
 
                 selesai = self.diam >= self.hold_off_n
@@ -216,9 +255,25 @@ class Detektor:
         if sisa > 0:
             data = data[:-sisa]
 
-        if len(data) < self.min_n:
-            return      # terlalu pendek: gangguan listrik atau getaran sesaat
+        if len(data) < self.min_n or self.n_lewat < self.min_lewat_n:
+            # Bukan kereta: gangguan listrik, getaran sesaat, atau kendaraan
+            # yang lewat di dekat rel. Dicatat jumlahnya supaya kalau
+            # penolakan jadi ratusan per jam, kelihatan bahwa ambangnya
+            # masih terlalu rendah untuk lokasi ini.
+            self.ditolak += 1
+            if data:
+                self.puncak_tolak = max(
+                    self.puncak_tolak,
+                    max(abs(v - self.base_saat_trigger) for v in data),
+                )
+            if self.ditolak % 20 == 0:
+                print(f"  (derau ditolak: {self.ditolak} kali, "
+                      f"puncak tertinggi {self.puncak_tolak:,.0f} hitungan)"
+                      .replace(",", "."), flush=True)
+            self.n_lewat = 0
+            return
 
+        self.n_lewat = 0
         self.jumlah_event += 1
         self.saat_selesai(data, self.base_saat_trigger, self.t_mulai, kepanjangan)
 
@@ -475,6 +530,63 @@ class ArsipMentah:
             self.f = None
 
 
+
+# ======================================================================
+# Pembukaan port yang tahan lepas-pasang
+# ======================================================================
+
+def cari_port(port_diminta):
+    """
+    Mencari port serial yang benar-benar ada.
+
+    Setelah ESP32 lepas dan tersambung lagi — karena kabel goyang, daya
+    turun sesaat, atau papan me-reset dirinya — Linux sering memberinya
+    nomor baru: ttyUSB0 jadi ttyUSB1. Kalau yang dicari nomor lama,
+    programnya gagal terus padahal alatnya sudah normal.
+
+    Jadi: pakai yang diminta kalau ada; kalau tidak, cari sendiri.
+    """
+    if port_diminta and os.path.exists(port_diminta):
+        return port_diminta
+
+    # Jalur by-id menempel pada perangkatnya, bukan urutan colok
+    import glob
+    kandidat = sorted(glob.glob('/dev/serial/by-id/*'))
+    if kandidat:
+        return kandidat[0]
+
+    kandidat = sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*'))
+    return kandidat[0] if kandidat else None
+
+
+def buka_port(cfg, diam=False):
+    """
+    Membuka port, menunggu sampai berhasil. Tidak pernah menyerah:
+    di lapangan tidak ada yang bisa menyalakannya kembali secara manual.
+    """
+    jeda = 2
+    sudah_lapor = False
+    while True:
+        port = cari_port(cfg["port"])
+        if port:
+            try:
+                ser = serial.Serial(port, cfg["baud"], timeout=1)
+                if port != cfg["port"]:
+                    print(f"  Port berpindah ke {port} (site.json menyebut {cfg['port']})")
+                elif sudah_lapor:
+                    print(f"  Tersambung lagi ke {port}")
+                return ser
+            except serial.SerialException as e:
+                if not sudah_lapor and not diam:
+                    print(f"  Gagal membuka {port}: {e}")
+        elif not sudah_lapor and not diam:
+            print(f"  Menunggu ESP32 tercolok ({cfg['port']} belum ada)...")
+
+        sudah_lapor = True
+        time.sleep(jeda)
+        jeda = min(jeda * 1.5, 30)      # mundur bertahap, maksimum 30 detik
+
+
 # ======================================================================
 # Program utama
 # ======================================================================
@@ -505,12 +617,12 @@ def main():
     print(f"Lokasi : {cfg['lokasi']}")
     print(f"Ambang : {cfg['ambang_hitungan']:,} hitungan"
           f"  (~{ke_microstrain(cfg['ambang_hitungan'], cfg):.1f} µε)".replace(",", "."))
+    print(f"Saring : butuh {cfg.get('debounce_detik', 0.008)*1000:.0f} ms berurutan "
+          f"di atas ambang untuk memicu, "
+          f"total {cfg.get('min_lewat_detik', 0.15)*1000:.0f} ms untuk diterima")
     print(f"Port   : {cfg['port']} @ {cfg['baud']}\n")
 
-    try:
-        ser = serial.Serial(cfg["port"], cfg["baud"], timeout=1)
-    except serial.SerialException as e:
-        sys.exit(f"Gagal membuka port: {e}")
+    ser = buka_port(cfg)
 
     arsip = ArsipMentah(cfg["dir_data"], fs, cfg["arsip_mentah"])
     pengirim = None
@@ -518,7 +630,7 @@ def main():
         pengirim = Pengirim(cfg, dir_antrean)
         pengirim.start()
 
-    stat = {"event": 0, "bad_crc": 0, "lost": 0, "sampel": 0}
+    stat = {"event": 0, "bad_crc": 0, "lost": 0, "sampel": 0, "putus": 0}
 
     def simpan_event(data, baseline, t_mulai, kepanjangan):
         fitur = hitung_fitur(data, baseline, fs,
@@ -539,8 +651,36 @@ def main():
         rel = [v - baseline for v in data]
         puncak_abs = max(abs(min(rel)), abs(max(rel)), 1.0)
         skala = max(1.0, puncak_abs / 32000.0)
-        kecil = [int(round(v / skala)) for v in rel]
-        mentah = struct.pack(f"<{len(kecil)}h", *kecil)
+
+        ringkas = float(cfg.get("ringkas_detik", 0) or 0)
+        if ringkas > 0:
+            # Peringkasan selubung (envelope), bukan pencuplikan.
+            #
+            # Mengambil satu sampel tiap detik akan hampir selalu jatuh di
+            # sela antar-gandar, karena puncaknya cuma sekitar 6% dari waktu.
+            # Puncak strain-nya — satu-satunya angka yang penting untuk
+            # kelelahan logam — kemungkinan besar terlewat.
+            #
+            # Jadi tiap kantong waktu diwakili dua angka: nilai terendah dan
+            # tertinggi di dalamnya. Puncaknya terjaga persis, dan grafiknya
+            # terbaca sebagai pita yang melebar saat kereta lewat.
+            n = max(1, int(fs * ringkas))
+            pasang = []
+            for i in range(0, len(rel), n):
+                potong = rel[i:i + n]
+                pasang.append(int(round(min(potong) / skala)))
+                pasang.append(int(round(max(potong) / skala)))
+            mentah = struct.pack(f"<{len(pasang)}h", *pasang)
+            dtype = "int16_minmax"
+            kantong_ms = int(ringkas * 1000)
+            n_titik = len(pasang) // 2
+        else:
+            kecil = [int(round(v / skala)) for v in rel]
+            mentah = struct.pack(f"<{len(kecil)}h", *kecil)
+            dtype = "int16"
+            kantong_ms = 0
+            n_titik = len(kecil)
+
         terkompresi = base64.b64encode(zlib.compress(mentah, 6)).decode()
 
         paket = {
@@ -555,8 +695,10 @@ def main():
             "v_excitation": cfg["v_excitation"],
             "gauge_factor": cfg["gauge_factor"],
             "terpotong": bool(kepanjangan),
-            "wf_dtype": "int16",
+            "wf_dtype": dtype,
             "wf_skala": round(skala, 6),
+            "wf_kantong_ms": kantong_ms,
+            "wf_titik": n_titik,
             "waveform_b64": terkompresi,
         }
         paket.update(fitur)
@@ -577,7 +719,8 @@ def main():
         print(f"  ▸ EVENT {stat['event']:3d}  {waktu.strftime('%H:%M:%S')}  "
               f"puncak {paket['puncak_ue']:8.1f} µε  "
               f"durasi {fitur['durasi_s']:5.2f} s  "
-              f"gandar {fitur['jumlah_gandar']:3d}"
+              f"gandar {fitur['jumlah_gandar']:3d}  "
+              f"{len(terkompresi)/1024:.1f} KB"
               + (f"  {fitur['kecepatan_kmh']:5.1f} km/h" if "kecepatan_kmh" in fitur else "")
               + tanda)
 
@@ -598,7 +741,25 @@ def main():
           f"{'simpangan':>11} {'event':>6} {'antre':>6}")
 
     while jalan["on"]:
-        chunk = ser.read(4096)
+        # ESP32 bisa lepas sewaktu-waktu: kabel goyang, daya turun sesaat,
+        # atau papan me-reset. Dulu program langsung mati dan systemd
+        # menyalakannya ulang — tapi itu menghapus penyangga pra-trigger
+        # dan baseline, jadi kereta yang lewat saat itu hilang. Sekarang
+        # portnya dibuka ulang di tempat, tanpa program berhenti.
+        try:
+            chunk = ser.read(4096)
+        except (serial.SerialException, OSError) as e:
+            print(f"  Port terputus: {e}")
+            stat["putus"] += 1
+            try:
+                ser.close()
+            except Exception:
+                pass
+            buf.clear()
+            prev_seq = None          # nomor urut mulai lagi dari awal
+            ser = buka_port(cfg)
+            continue
+
         if chunk:
             buf.extend(chunk)
 
@@ -664,6 +825,8 @@ def main():
                 except OSError:
                     antre = 0
                 status = "AKTIF" if detektor.aktif else ""
+                if stat["putus"]:
+                    status += f"  putus {stat['putus']}x"
                 print(f"{time.strftime('%H:%M:%S'):>8} {len(jendela)/dt:8.1f}/s "
                       f"{b:11.0f} {rms:9.0f} {simpangan:11.0f} "
                       f"{stat['event']:6d} {antre:6d}  {status}")
@@ -680,12 +843,26 @@ def main():
     print(f"\nSelesai. {durasi/60:.1f} menit, {stat['sampel']:,} sampel."
           .replace(",", "."))
     print(f"Event terdeteksi : {stat['event']}")
+    if detektor.tertahan:
+        print(f"Lonjakan ditahan  : {detektor.tertahan}"
+              f"  (lewat ambang tapi tidak bertahan {cfg.get('debounce_detik', 0.008)*1000:.0f} ms)")
+    if detektor.ditolak:
+        print(f"Derau ditolak    : {detektor.ditolak}"
+              f"  (puncak tertinggi {detektor.puncak_tolak:,.0f} hitungan)"
+              .replace(",", "."))
+        if detektor.ditolak > max(5, stat['event'] * 3):
+            print("  Penolakan jauh lebih banyak daripada event. Ambangnya "
+                  "kemungkinan masih terlalu rendah untuk lokasi ini —\n"
+                  "  naikkan ambang_hitungan sedikit di atas puncak tertinggi "
+                  "di baris atas.")
     if pengirim:
         print(f"Terkirim         : {pengirim.terkirim}")
         sisa = len([f for f in os.listdir(dir_antrean) if f.endswith('.json')])
         if sisa:
             print(f"Masih mengantre  : {sisa}  (akan dikirim saat program dijalankan lagi)")
     print(f"Bingkai rusak    : {stat['bad_crc']}   Sampel hilang: {stat['lost']}")
+    if stat["putus"]:
+        print(f"Port terputus    : {stat['putus']} kali — periksa kabel USB dan catu daya")
 
 
 if __name__ == "__main__":
